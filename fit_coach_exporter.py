@@ -458,6 +458,37 @@ def rolling_mean_best(values: List[Optional[float]], seconds: int) -> Optional[f
     return float(np.max(wsum[complete] / seconds))
 
 
+def rolling_mean_best_nonzero(values: List[Optional[float]], seconds: int) -> Optional[float]:
+    """
+    Highest mean power over any window of *seconds* length composed entirely
+    of non-NaN, non-zero power samples.
+
+    Used exclusively for FTP estimation.  Unlike rolling_mean_best(), this
+    function skips zero-power seconds (coasting, stopped, neutral laps) so
+    that warmup, traffic stops, or cool-down do not dilute the 20-minute
+    best effort used for FTP estimation.
+
+    A window qualifies when every one of its *seconds* slots is > 0 W
+    (i.e. neither NaN nor zero).  This matches how a rider actually selects
+    their best 20-minute effort for FTP testing.
+    """
+    if seconds <= 0:
+        return None
+    arr = np.array([np.nan if (v is None or v == 0.0) else float(v) for v in values], dtype=float)
+    if len(arr) < seconds:
+        return None
+    valid = ~np.isnan(arr)
+    filled = np.where(valid, arr, 0.0)
+    csum = np.cumsum(np.insert(filled, 0, 0.0))
+    vcum = np.cumsum(np.insert(valid.astype(int), 0, 0))
+    wsum = csum[seconds:] - csum[:-seconds]
+    wcnt = vcum[seconds:] - vcum[:-seconds]
+    complete = wcnt == seconds
+    if not complete.any():
+        return None
+    return float(np.max(wsum[complete] / seconds))
+
+
 def normalized_power(
     power_1hz: List[Optional[float]],
     timeline_is_dense: bool,
@@ -1303,7 +1334,7 @@ def _apply_effort_channel_imputation(
 
     for col in ["distance", "altitude"]:
         if col in df.columns:
-            df[col] = df[col].interpolate(method="time")
+            df[col] = pd.to_numeric(df[col], errors="coerce").interpolate(method="time")
 
     if "temperature" in df.columns:
         df["temperature"] = df["temperature"].ffill()
@@ -1441,7 +1472,7 @@ def _resolve_ftp(
         activity.ftp_source = "user_provided"
         return user_ftp
 
-    best_20min = rolling_mean_best(power_1hz, 1200)
+    best_20min = rolling_mean_best_nonzero(power_1hz, 1200)
     if best_20min is not None:
         estimated = round(best_20min * 0.95, 1)
         activity.estimated_ftp_w = estimated
