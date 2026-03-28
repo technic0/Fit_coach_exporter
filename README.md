@@ -354,7 +354,7 @@ fitdecode
 
 ## Licence
 
-Add a licence appropriate for your project, e.g. MIT, Apache-2.0, or a private licence if the repository is not intended to be public.
+MIT, Apache-2.0
 
 ---
 
