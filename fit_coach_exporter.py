@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-fit_coach_exporter.py  — v3.3.3  (Production Grade / Zero Compromises)
+fit_coach_exporter.py
 
 Batch converter for cycling FIT files (Garmin Edge, Wahoo KICKR, MyWhoosh and
 similar) into coach-friendly CSV datasets.
