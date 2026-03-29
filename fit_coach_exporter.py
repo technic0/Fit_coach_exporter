@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-fit_coach_exporter.py
+fit_coach_exporter.py  — v3.4.0  (Production Grade / Zero Compromises)
 
 Batch converter for cycling FIT files (Garmin Edge, Wahoo KICKR, MyWhoosh and
 similar) into coach-friendly CSV datasets.
@@ -134,7 +134,7 @@ logger = logging.getLogger(__name__)
 
 # ── Schema version ────────────────────────────────────────────────────────────
 # Bump when any CSV column is added, removed, or renamed.
-EXPORT_SCHEMA_VERSION = "3.3.3"
+EXPORT_SCHEMA_VERSION = "3.4.0"
 
 # ── Power metrics quality status values ───────────────────────────────────────
 # These are the only valid values for FitActivity.power_metrics_quality.
@@ -163,6 +163,44 @@ _SPARSE_POWER_MIN_VALID_SAMPLES: int = 300
 # records carry a non-NaN value.  This is a heuristic, not a sensor-quality
 # measurement — see module docstring for full semantics.
 _CHANNEL_SPARSE_COVERAGE_THRESHOLD: float = 0.50  # < 50 % → low coverage
+
+# ── NP rolling-window constants ───────────────────────────────────────────────
+# 30 s rolling mean per Coggan specification.
+# min_periods=25 allows sparse series to produce NP without full-window coverage.
+_NP_ROLLING_WINDOW_SEC: int = 30
+_NP_SPARSE_MIN_PERIODS: int = 25
+
+# ── HR zone boundaries (two separate models — do NOT share thresholds) ────────
+# LTHR-based zones: Friel/Coggan FTHR 5-zone model.
+# Ratios are relative to Lactate Threshold HR (LTHR).  These boundaries
+# are only valid when LTHR is the reference; they must never be applied
+# to max_hr as a reference because the physiological anchors differ.
+_HR_ZONE_BOUNDS_LTHR: List[float] = [0.0, 0.81, 0.89, 0.94, 1.00, float("inf")]
+
+# MHR-based zones: Coggan 5-zone % of maximum HR.
+# Ratios are relative to maximum HR (max_hr).  These boundaries apply
+# only when LTHR is unavailable.  The thresholds are deliberately
+# different from the LTHR model — do NOT substitute one for the other.
+_HR_ZONE_BOUNDS_MAX_HR: List[float] = [0.0, 0.60, 0.70, 0.80, 0.90, float("inf")]
+
+# ── Pw:Hr decoupling quality gate ─────────────────────────────────────────────
+# Minimum active paired seconds required per half for a meaningful result.
+_PWHR_MIN_PAIRED_SECONDS_PER_HALF: int = 60
+
+# ── FIT left/right balance bit-mask constants ─────────────────────────────────
+# FIT field `left_right_balance` is a uint8:
+#   bit 7 (0x80): if SET, bits 6-0 represent the RIGHT side percentage;
+#                 if CLEAR, bits 6-0 represent the LEFT (or unspecified) side.
+#   bits 6-0 (0x7F): percentage of the reference side (integer, 0–100).
+_LEFT_RIGHT_BALANCE_RIGHT_FLAG: int = 0x80
+_LEFT_RIGHT_BALANCE_MASK: int = 0x7F
+
+# ── Best efforts durations ────────────────────────────────────────────────────
+# Ordered shortest-to-longest.  Include common sprint, short-effort,
+# and endurance durations used in coach analysis.
+_BEST_EFFORTS_SECONDS: List[int] = [
+    2, 5, 10, 15, 20, 30, 60, 120, 180, 300, 360, 480, 600, 1200, 2700, 3600
+]
 
 
 # ---------------------------------------------------------------------------
@@ -501,14 +539,14 @@ def normalized_power(
     Returns None when fewer than 30 valid samples are present.
     """
     arr = np.array([np.nan if v is None else float(v) for v in power_1hz], dtype=float)
-    if int(np.sum(~np.isnan(arr))) < 30:
+    if int(np.sum(~np.isnan(arr))) < _NP_ROLLING_WINDOW_SEC:
         return None
     if timeline_is_dense:
         arr = np.where(np.isnan(arr), 0.0, arr)
-        roll = np.convolve(arr, np.ones(30) / 30, mode="valid")
+        roll = np.convolve(arr, np.ones(_NP_ROLLING_WINDOW_SEC) / _NP_ROLLING_WINDOW_SEC, mode="valid")
         return float(np.mean(roll ** 4) ** 0.25)
     s = pd.Series(arr)
-    roll = s.rolling(30, min_periods=25).mean().dropna()
+    roll = s.rolling(_NP_ROLLING_WINDOW_SEC, min_periods=_NP_SPARSE_MIN_PERIODS).mean().dropna()
     if len(roll) < 1:
         return None
     return float((roll ** 4).mean() ** 0.25)
@@ -571,24 +609,81 @@ def trimp_score(
 
 def calculate_pw_hr_decoupling(df_1hz: pd.DataFrame) -> Optional[float]:
     """
-    Simplified Pw:Hr decoupling — first-half vs second-half ratio.
+    EF-based Pw:Hr aerobic decoupling — first half vs second half by elapsed time.
 
-    Limitations: 50/50 split by paired row count, not elapsed time.
-    Warm-up / cool-down / intervals distort the boundary.
-    Returns None when fewer than 60 valid paired samples exist.
+    Splits the active portion (power > 0 AND heart_rate > 0) at the
+    elapsed-time midpoint — not at the midpoint of paired row count.
+    For each half, computes EF = NP / avg_HR and returns
+    (EF₂ − EF₁) / EF₁ × 100.
+
+    This metric is most meaningful for steady-state aerobic efforts such as
+    threshold or long endurance rides.  Interval workouts, sprints, and
+    activities with significant warm-up/cool-down will produce values that
+    are harder to interpret — treat with caution in those contexts.
+
+    Returns None when:
+    - Channels are absent.
+    - Either half has fewer than _PWHR_MIN_PAIRED_SECONDS_PER_HALF valid rows.
+    - NP or avg_HR cannot be computed for either half.
     """
-    if df_1hz.empty or "power" not in df_1hz.columns or "heart_rate" not in df_1hz.columns:
+    if df_1hz.empty:
         return None
-    df = df_1hz[["power", "heart_rate"]].dropna()
-    df = df[(df["power"] > 0) & (df["heart_rate"] > 0)]
-    if len(df) < 60:
+    if not {"power", "heart_rate"}.issubset(df_1hz.columns):
         return None
-    mid = len(df) // 2
-    r1 = df.iloc[:mid]["power"].mean() / df.iloc[:mid]["heart_rate"].mean()
-    r2 = df.iloc[mid:]["power"].mean() / df.iloc[mid:]["heart_rate"].mean()
-    if r1 == 0:
+
+    # Derive timeline density from inline quality column when available.
+    is_dense = (
+        bool(df_1hz["timeline_is_dense_1hz"].iloc[0])
+        if "timeline_is_dense_1hz" in df_1hz.columns
+        else True
+    )
+
+    # Work with active rows only: power > 0 AND heart_rate > 0.
+    active_mask = (
+        (df_1hz["power"].fillna(0) > 0) & (df_1hz["heart_rate"].fillna(0) > 0)
+    )
+    df_active = df_1hz[active_mask].copy()
+
+    if len(df_active) < _PWHR_MIN_PAIRED_SECONDS_PER_HALF * 2:
         return None
-    return float((r2 - r1) / r1 * 100.0)
+
+    # Time-based split at elapsed-time midpoint of the active portion.
+    if "timestamp" in df_active.columns:
+        ts = pd.to_datetime(df_active["timestamp"], utc=True, errors="coerce")
+        t_start = ts.dropna().min()
+        t_end = ts.dropna().max()
+        if pd.isna(t_start) or pd.isna(t_end) or t_start == t_end:
+            return None
+        t_mid = t_start + (t_end - t_start) / 2
+        first_half = df_active[ts < t_mid]
+        second_half = df_active[ts >= t_mid]
+    else:
+        # Fallback: equal row-count split when no timestamps.
+        mid = len(df_active) // 2
+        first_half = df_active.iloc[:mid]
+        second_half = df_active.iloc[mid:]
+
+    if len(first_half) < _PWHR_MIN_PAIRED_SECONDS_PER_HALF:
+        return None
+    if len(second_half) < _PWHR_MIN_PAIRED_SECONDS_PER_HALF:
+        return None
+
+    np1 = normalized_power(first_half["power"].tolist(), timeline_is_dense=is_dense)
+    np2 = normalized_power(second_half["power"].tolist(), timeline_is_dense=is_dense)
+    hr1 = float(first_half["heart_rate"].mean())
+    hr2 = float(second_half["heart_rate"].mean())
+
+    if np1 is None or np2 is None:
+        return None
+    if math.isnan(hr1) or math.isnan(hr2) or hr1 == 0 or hr2 == 0:
+        return None
+
+    ef1 = np1 / hr1
+    ef2 = np2 / hr2
+
+    if ef1 == 0:
+        return None
+    return float((ef2 - ef1) / ef1 * 100.0)
 
 
 def time_in_power_zones(
@@ -618,14 +713,29 @@ def time_in_hr_zones(
     lthr: Optional[float],
     max_hr: Optional[float],
 ) -> Dict[str, Optional[float]]:
-    """Seconds in each Friel 5-zone HR model.  None values when ref absent."""
+    """
+    Seconds in each Friel/Coggan 5-zone HR model.
+
+    Uses LTHR-based boundaries (_HR_ZONE_BOUNDS_LTHR) when lthr is provided,
+    and MHR-based boundaries (_HR_ZONE_BOUNDS_MAX_HR) when only max_hr is
+    available.  The two sets of thresholds are intentionally different and
+    must never be mixed — see module-level constants for details.
+
+    Returns None values for all zones when no reference is available.
+    """
     names = ["hr_z1_sec", "hr_z2_sec", "hr_z3_sec", "hr_z4_sec", "hr_z5_sec"]
     null_result: Dict[str, Optional[float]] = dict.fromkeys(names, None)
-    ref = lthr if lthr is not None else max_hr
-    if ref is None or ref == 0 or df_1hz.empty or "heart_rate" not in df_1hz.columns:
+    if df_1hz.empty or "heart_rate" not in df_1hz.columns:
+        return null_result
+    if lthr is not None and lthr != 0:
+        ref = lthr
+        bounds = _HR_ZONE_BOUNDS_LTHR
+    elif max_hr is not None and max_hr != 0:
+        ref = max_hr
+        bounds = _HR_ZONE_BOUNDS_MAX_HR
+    else:
         return null_result
     hr = df_1hz["heart_rate"].dropna()
-    bounds = [0.0, 0.81, 0.89, 0.94, 1.00, float("inf")]
     ratios = hr / ref
     return {
         name: float(((ratios >= bounds[i]) & (ratios < bounds[i + 1])).sum())
@@ -668,6 +778,61 @@ def derive_grade_from_records(
         float(x["grade_pct"].quantile(0.99)),
         float(x.loc[x["d_alt"] > elevation_threshold_m, "d_alt"].sum()),
     )
+
+
+def compute_work_kj(
+    df_1hz: pd.DataFrame,
+    total_timer_time_s: Optional[float],
+    avg_power_w: Optional[float],
+    timeline_is_dense: bool,
+) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Compute work in kilojoules with explicit provenance.
+
+    Returns (work_kj, work_kj_basis) where work_kj_basis is one of:
+      "dense_1hz_sum"       — dense 1 Hz power sum (zeros fill gaps; most accurate).
+      "session_avg_x_timer" — avg_power × timer_time fallback; less accurate on
+                              activities with significant coasting.
+      "sparse_observed_only" — sparse timeline sum (NaN rows excluded); may
+                               undercount because unrecorded gaps are skipped.
+
+    Returns (None, None) when no power data is available at all.
+    """
+    has_power_col = "power" in df_1hz.columns and not df_1hz["power"].dropna().empty
+
+    if timeline_is_dense and has_power_col:
+        # Dense: zeros represent real coasting; sum over all seconds.
+        value = float(df_1hz["power"].fillna(0).sum() / 1000.0)
+        return value, "dense_1hz_sum"
+
+    if total_timer_time_s is not None and avg_power_w is not None:
+        # Fallback: session summary values from FIT header.
+        value = float(avg_power_w * total_timer_time_s / 1000.0)
+        return value, "session_avg_x_timer"
+
+    if has_power_col:
+        # Sparse timeline — only observed (non-NaN) seconds are summed.
+        # Gaps are not modelled as zero; result may undercount true work.
+        value = float(df_1hz["power"].dropna().sum() / 1000.0)
+        return value, "sparse_observed_only"
+
+    return None, None
+
+
+def efficiency_factor(
+    np_w: Optional[float],
+    avg_hr_bpm: Optional[float],
+) -> Optional[float]:
+    """
+    Efficiency Factor: NP / avg_heart_rate.
+
+    A higher EF indicates more power output per heartbeat.  Useful for
+    tracking aerobic fitness progression over time.
+    Returns None when NP or avg_HR is missing or HR is zero.
+    """
+    if np_w is None or avg_hr_bpm is None or avg_hr_bpm == 0:
+        return None
+    return float(np_w / avg_hr_bpm)
 
 
 # ---------------------------------------------------------------------------
@@ -927,8 +1092,10 @@ class FitActivity:
     intensity_factor: Optional[float] = None
     variability_index: Optional[float] = None
     work_kj: Optional[float] = None
+    work_kj_basis: Optional[str] = None
     pw_hr_decoupling_pct: Optional[float] = None
     trimp: Optional[float] = None
+    efficiency_factor: Optional[float] = None
     left_right_balance_pct: Optional[float] = None
     balance_left_pct: Optional[float] = None
     balance_right_pct: Optional[float] = None
@@ -962,6 +1129,7 @@ class FitActivity:
     power_quality_note: Optional[str] = None
     record_count: int = 0
     lap_count: int = 0
+    coasting_time_sec: Optional[float] = None
     z1_recovery_sec: Optional[float] = None
     z2_endurance_sec: Optional[float] = None
     z3_tempo_sec: Optional[float] = None
@@ -1076,11 +1244,19 @@ def _handle_session(activity: FitActivity, fields: Dict[str, Any]) -> None:
     raw_balance = safe_float(fields.get("left_right_balance"))
     activity.left_right_balance_pct = raw_balance
     if raw_balance is not None:
+        # FIT left_right_balance encoding (see _LEFT_RIGHT_BALANCE_* constants):
+        # bit 7 (0x80) set  → the masked value is the RIGHT side percentage.
+        # bit 7 (0x80) clear → the masked value is the LEFT side percentage.
         raw_int = int(raw_balance)
-        left_pct = float((raw_int & 0x7F) if raw_int >= 128 else raw_int)
-        left_pct = max(0.0, min(100.0, left_pct))
+        masked = float(raw_int & _LEFT_RIGHT_BALANCE_MASK)
+        if raw_int & _LEFT_RIGHT_BALANCE_RIGHT_FLAG:
+            right_pct = max(0.0, min(100.0, masked))
+            left_pct = 100.0 - right_pct
+        else:
+            left_pct = max(0.0, min(100.0, masked))
+            right_pct = 100.0 - left_pct
         activity.balance_left_pct = left_pct
-        activity.balance_right_pct = 100.0 - left_pct
+        activity.balance_right_pct = right_pct
     activity.pedal_smoothness_pct = safe_float(fields.get("avg_left_pedal_smoothness"))
     activity.torque_effectiveness_pct = safe_float(fields.get("avg_left_torque_effectiveness"))
 
@@ -1102,9 +1278,13 @@ def _handle_event(activity: FitActivity, fields: Dict[str, Any]) -> None:
     if str(ev).lower() == "timer" and str(ev_type).lower() == "start":
         if activity.start_time is None:
             activity.start_time = to_iso(fields.get("timestamp"))
-    trainer_val = _str_field(fields, "data")
-    if trainer_val is not None and activity.trainer_mode is None:
-        activity.trainer_mode = trainer_val
+    # trainer_mode is NOT extracted from generic event `data` fields because
+    # there is no standard FIT event type that reliably encodes trainer mode.
+    # Blindly capturing `data` from arbitrary events would produce spurious
+    # trainer_mode values (e.g. lap counters, timer data) and incorrectly
+    # force detect_indoor() to classify the activity as indoor.
+    # Indoor detection relying on trainer_mode should only be set from a
+    # clearly identified source; sub_sport is currently the primary signal.
 
 
 def _build_lap_row(
@@ -1581,12 +1761,20 @@ def _compute_load_metrics(
             duration, activity.normalized_power_w, effective_ftp
         )
     if activity.work_kj is None:
-        if activity.total_timer_time_s is not None and activity.avg_power_w is not None:
-            activity.work_kj = float(
-                activity.avg_power_w * activity.total_timer_time_s / 1000.0
-            )
-        elif "power" in df_1hz.columns and not df_1hz["power"].dropna().empty:
-            activity.work_kj = float(df_1hz["power"].dropna().sum() / 1000.0)
+        wkj, basis = compute_work_kj(
+            df_1hz,
+            activity.total_timer_time_s,
+            activity.avg_power_w,
+            activity.timeline_is_dense_1hz,
+        )
+        activity.work_kj = wkj
+        activity.work_kj_basis = basis
+
+    # Coasting seconds: rows where power == 0 on a dense timeline.
+    # On dense timelines zeros are meaningful (confirmed coasting / not pedalling).
+    # On sparse timelines zeros may just be absent data; the metric is withheld.
+    if activity.timeline_is_dense_1hz and "power" in df_1hz.columns:
+        activity.coasting_time_sec = float((df_1hz["power"].fillna(0) == 0).sum())
 
     if "cadence" in df_1hz.columns:
         cad_nz = df_1hz.loc[df_1hz["cadence"] > 0, "cadence"]
@@ -1704,6 +1892,7 @@ def compute_hr_metrics(
     resting_hr: Optional[float],
     max_hr: Optional[float],
     lthr: Optional[float],
+    sex: str = "male",
 ) -> None:
     """Compute TRIMP, Pw:Hr decoupling, and HR zones.  Mutates *activity*."""
     activity.is_complete_for_hr_analysis = activity.has_hr and (
@@ -1712,7 +1901,7 @@ def compute_hr_metrics(
     hr_1hz: List[Optional[float]] = df_1hz.get(
         "heart_rate", pd.Series(dtype=float)
     ).tolist()
-    activity.trimp = trimp_score(hr_1hz, resting_hr, max_hr)
+    activity.trimp = trimp_score(hr_1hz, resting_hr, max_hr, sex=sex)
     activity.pw_hr_decoupling_pct = calculate_pw_hr_decoupling(df_1hz)
 
     zh = time_in_hr_zones(df_1hz, lthr, max_hr)
@@ -1739,11 +1928,15 @@ def compute_session_metrics(
     max_hr: Optional[float],
     lthr: Optional[float],
     quality: TimelineQuality,
+    sex: str = "male",
 ) -> Optional[float]:
     """Orchestrate session-level metrics.  Returns effective_ftp."""
     compute_basic_activity_stats(activity, df_1hz, quality)
     effective_ftp = compute_power_metrics(activity, df_1hz, user_ftp, quality)
-    compute_hr_metrics(activity, df_1hz, resting_hr, max_hr, lthr)
+    compute_hr_metrics(activity, df_1hz, resting_hr, max_hr, lthr, sex=sex)
+    activity.efficiency_factor = efficiency_factor(
+        activity.normalized_power_w, activity.avg_heart_rate_bpm
+    )
     return effective_ftp
 
 
@@ -1815,7 +2008,7 @@ def _compute_zone_series(
 
     ref = lthr if lthr is not None else max_hr
     if ref is not None and ref > 0 and "heart_rate" in df.columns:
-        hr_bounds = [0.0, 0.81, 0.89, 0.94, 1.00, float("inf")]
+        hr_bounds = _HR_ZONE_BOUNDS_LTHR if lthr is not None else _HR_ZONE_BOUNDS_MAX_HR
         r_hr = df["heart_rate"].fillna(-1) / ref
         conds_hr = [(r_hr >= hr_bounds[i]) & (r_hr < hr_bounds[i + 1]) for i in range(5)]
         hz_raw = np.select(conds_hr, list(range(1, 6)), default=-1)
@@ -2279,6 +2472,7 @@ def parse_fit_file(
     resting_hr: Optional[float] = None,
     max_hr: Optional[float] = None,
     lthr: Optional[float] = None,
+    sex: str = "male",
 ) -> ParsedFitFile:
     """
     Orchestrate the full pipeline for a single FIT file.
@@ -2379,7 +2573,7 @@ def parse_fit_file(
     # Stage 6 ─────────────────────────────────────────────────────────────────
     try:
         effective_ftp = compute_session_metrics(
-            activity, df_1hz, ftp, resting_hr, max_hr, lthr, quality
+            activity, df_1hz, ftp, resting_hr, max_hr, lthr, quality, sex=sex
         )
     except Exception as exc:
         return _make_error_result(activity, inventory, exc,
@@ -2417,7 +2611,7 @@ def parse_fit_file(
         # Best efforts follow the same quality gate as all other power metrics.
         compute_best_efforts = (activity.power_metrics_quality in (_PMQ_FULL, _PMQ_SPARSE_WARNING))
         best_efforts: List[BestEffortRow] = []
-        for sec in [5, 15, 30, 60, 180, 300, 600, 1200]:
+        for sec in _BEST_EFFORTS_SECONDS:
             value = rolling_mean_best(power_1hz, sec) if compute_best_efforts else None
             best_efforts.append(BestEffortRow(
                 source_file=file_path.name,
@@ -2486,7 +2680,8 @@ ACTIVITIES_COLUMNS: List[str] = [
     "avg_cadence_rpm", "max_cadence_rpm", "avg_cadence_no_zeros_rpm",
     "avg_temperature_c", "max_temperature_c", "calories_kcal",
     "training_stress_score", "intensity_factor", "variability_index",
-    "work_kj", "pw_hr_decoupling_pct", "trimp",
+    "work_kj", "work_kj_basis", "pw_hr_decoupling_pct", "trimp",
+    "efficiency_factor",
     "left_right_balance_pct", "balance_left_pct", "balance_right_pct",
     "pedal_smoothness_pct", "torque_effectiveness_pct",
     "trainer_mode", "indoor", "indoor_source",
@@ -2499,7 +2694,7 @@ ACTIVITIES_COLUMNS: List[str] = [
     "power_channel_is_low_coverage", "speed_channel_is_low_coverage",
     "timeline_median_gap_s", "timeline_max_gap_s",
     "power_metrics_quality", "power_quality_note",
-    "record_count", "lap_count",
+    "record_count", "lap_count", "coasting_time_sec",
     "z1_recovery_sec", "z2_endurance_sec", "z3_tempo_sec", "z4_threshold_sec",
     "z5_vo2_sec", "z6_anaerobic_sec", "z7_neuromuscular_sec",
     "hr_z1_sec", "hr_z2_sec", "hr_z3_sec", "hr_z4_sec", "hr_z5_sec",
@@ -2684,6 +2879,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-recursive", action="store_true",
         help="Do not search subfolders for .fit files",
     )
+    p.add_argument(
+        "--sex",
+        choices=["male", "female"],
+        default="male",
+        help="Athlete sex for TRIMP calculation (default: male)",
+    )
     return p
 
 
@@ -2747,6 +2948,7 @@ def main() -> int:
             resting_hr=args.resting_hr,
             max_hr=args.max_hr,
             lthr=args.lthr,
+            sex=args.sex,
         )
         csv_writer.write_parsed_file(result)
         summary.update(result)
