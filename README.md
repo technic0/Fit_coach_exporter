@@ -38,7 +38,7 @@ This gives a coach or analyst data in a format that can be easily filtered, aggr
   - processing error,
 - careful handling of sparse / smart-recording data,
 - quality flags for imputed data and data quality limitations,
-- support for user-supplied FTP / HR values or fallbacks calculated from the data.
+- support for user-supplied FTP / HR values.
 
 ---
 
@@ -59,7 +59,6 @@ Depending on data quality and completeness, the tool can calculate, among others
 - time in power zones,
 - time in HR zones,
 - **best efforts** for common durations,
-- estimated FTP from best 20 minutes, if FTP was not provided manually,
 - activity classification as `indoor`, `outdoor`, or `unknown`.
 
 In addition, the tool exports structural data present in the FIT file, when available:
@@ -73,6 +72,13 @@ Not all metrics are calculated every time. When data quality is too poor, the to
 - add a quality flag,
 - or describe the limitation in quality fields,
 rather than produce plausibly-looking but unreliable numbers.
+
+> **Important:** Power-dependent metrics (IF, TSS, NP, power zones) require FTP
+> to be supplied explicitly via `--ftp`. The tool does not estimate FTP
+> automatically — outdoor rides with stops, coasting, and variable pacing do
+> not reliably contain a clean 20-minute maximal effort, so any automatic
+> estimate would be untrustworthy. Always pass the FTP value configured on
+> your bike computer or from a dedicated FTP test.
 
 ---
 
@@ -196,8 +202,6 @@ Machine-readable quality status for power-dependent metrics:
 - `withheld` — power-dependent metrics were deliberately withheld due to insufficient data; this includes `NP`, `NP_moving`, `IF`, `TSS`, `work_kj`, `VI`, time in power zones, `power_zone` in `records_1hz`, and `best_efforts`; `power_quality_note` lists the withheld metrics.
 - `None` — no power channel present in the FIT file; quality assessment does not apply.
 
-`estimated_ftp_from_20min` in `best_efforts.csv` may still be present regardless of the above gating, as it is determined via a separate path from the best 20-minute effort.
-
 ### `power_quality_note`
 Human-readable description, always consistent with `power_metrics_quality`:
 - `full` on a dense timeline — empty (`None`),
@@ -225,7 +229,8 @@ pip install pandas numpy fitdecode
 ```bash
 python fit_coach_exporter.py \
   --input ./ride.fit \
-  --output ./coach_csv
+  --output ./coach_csv \
+  --ftp 205
 ```
 
 ### Directory of FIT files
@@ -233,17 +238,18 @@ python fit_coach_exporter.py \
 ```bash
 python fit_coach_exporter.py \
   --input ./fit_files \
-  --output ./coach_csv
+  --output ./coach_csv \
+  --ftp 205
 ```
 
-### With athlete data
+### With full athlete data
 
 ```bash
 python fit_coach_exporter.py \
   --input ./fit_files \
   --output ./coach_csv \
   --athlete "Przemek" \
-  --ftp 250 \
+  --ftp 205 \
   --resting-hr 50 \
   --max-hr 185 \
   --lthr 170
@@ -255,6 +261,7 @@ python fit_coach_exporter.py \
 python fit_coach_exporter.py \
   --input ./fit_files \
   --output ./coach_csv \
+  --ftp 205 \
   --no-recursive
 ```
 
@@ -265,7 +272,7 @@ python fit_coach_exporter.py \
 - `--input` — a single `.fit` file or a directory of files,
 - `--output` — output directory for CSV files,
 - `--athlete` — athlete name appended to all rows,
-- `--ftp` — FTP in watts; if omitted, the tool may estimate FTP from the best 20 minutes,
+- `--ftp` — FTP in watts. **Required for power-dependent metrics** (IF, TSS, NP, power zones). FTP is not estimated automatically — always supply the value from your device settings or a recent dedicated test.
 - `--resting-hr` — resting heart rate in bpm; required for TRIMP,
 - `--max-hr` — maximum heart rate in bpm,
 - `--lthr` — lactate threshold heart rate in bpm,
@@ -290,19 +297,22 @@ Argument validation checks, among other things, the consistency of HR value rela
 ### 1. This is not a full replacement for TrainingPeaks / WKO / Intervals.icu
 This tool is primarily an **analytic exporter**, not a complete coaching platform.
 
-### 2. Quality flags matter
+### 2. FTP must be supplied manually
+The tool does not estimate FTP automatically. Outdoor rides with stops, traffic lights, coasting, and variable pacing do not reliably produce a clean 20-minute maximal effort, so any automatic estimate from such data would be untrustworthy and could severely understate your actual FTP. Always pass `--ftp` with the value configured on your bike computer or from a dedicated FTP test.
+
+### 3. Quality flags matter
 If a file was recorded at a lower rate, with gaps, or using smart recording, some metrics may be:
 - flagged with a warning,
 - withheld,
 - or subject to greater uncertainty.
 
-### 3. `power_channel_is_low_coverage` and `speed_channel_is_low_coverage` are heuristics
+### 4. `power_channel_is_low_coverage` and `speed_channel_is_low_coverage` are heuristics
 These are auxiliary signals based on data coverage, not an objective measure of sensor quality.
 
-### 4. `Pw:Hr decoupling` is simplified
+### 5. `Pw:Hr decoupling` is simplified
 The metric is based on a simplified 50/50 split of the activity and should be interpreted with caution, especially for workouts containing warm-up, cool-down, and intervals.
 
-### 5. Grade is calculated conservatively
+### 6. Grade is calculated conservatively
 Gradient metrics are only calculated for activities confirmed as outdoor.
 
 ---
@@ -354,7 +364,7 @@ fitdecode
 
 ## Licence
 
-MIT, Apache-2.0
+Add a licence appropriate for your project, e.g. MIT, Apache-2.0, or a private licence if the repository is not intended to be public.
 
 ---
 
