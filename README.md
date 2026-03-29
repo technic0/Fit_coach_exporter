@@ -2,6 +2,8 @@
 
 `fit_coach_exporter` is a Python CLI tool for processing `.fit` files from cycling workouts and exporting data to stable CSV files, ready for further analysis by a coach, in Excel, pandas, or BI tools.
 
+**Current schema version: `3.4.0`**
+
 Supports both:
 - **indoor** rides — e.g. Wahoo KICKR, ERG workouts, MyWhoosh,
 - **outdoor** rides — e.g. Garmin Edge and other devices that record FIT files.
@@ -54,11 +56,15 @@ Depending on data quality and completeness, the tool can calculate, among others
 - **Intensity Factor (IF)**,
 - **Training Stress Score (TSS)**,
 - **Variability Index (VI)**,
-- **TRIMP**,
-- **Pw:Hr decoupling**,
+- **TRIMP** (sex-specific Banister formula when `--sex` is provided),
+- **Efficiency Factor (EF)** — NP / average HR,
+- **Pw:Hr decoupling** (EF-based, time-midpoint split),
 - time in power zones,
-- time in HR zones,
-- **best efforts** for common durations,
+- time in HR zones (with separate boundary tables for LTHR-based and max-HR-based zones),
+- **best efforts** for 16 standard durations (2 s – 60 min),
+- `work_kj` with provenance field `work_kj_basis` (dense sum / session average / sparse observed),
+- `coasting_time_sec` — seconds with zero power on a dense timeline,
+- left/right pedal balance (decoded from device bitmask),
 - activity classification as `indoor`, `outdoor`, or `unknown`.
 
 In addition, the tool exports structural data present in the FIT file, when available:
@@ -143,15 +149,10 @@ Normalised 1 Hz timeline with helper fields, e.g.:
 - timeline quality and channel coverage flags.
 
 ### `best_efforts.csv`
-Best mean powers for standard durations:
-- 5 s,
-- 15 s,
-- 30 s,
-- 1 min,
-- 3 min,
-- 5 min,
-- 10 min,
-- 20 min.
+Best mean powers for 16 standard durations:
+- 2 s, 5 s, 10 s, 15 s, 20 s, 30 s,
+- 1 min, 2 min, 3 min, 5 min, 6 min, 8 min,
+- 10 min, 20 min, 45 min, 60 min.
 
 ### `file_inventory.csv`
 List of processed files and their processing status. This is the primary file for batch quality control.
@@ -252,7 +253,8 @@ python fit_coach_exporter.py \
   --ftp 205 \
   --resting-hr 50 \
   --max-hr 185 \
-  --lthr 170
+  --lthr 170 \
+  --sex female
 ```
 
 ### Without subdirectory search
@@ -276,6 +278,7 @@ python fit_coach_exporter.py \
 - `--resting-hr` — resting heart rate in bpm; required for TRIMP,
 - `--max-hr` — maximum heart rate in bpm,
 - `--lthr` — lactate threshold heart rate in bpm,
+- `--sex {male,female}` — athlete sex, used to select the correct TRIMP coefficient (Banister formula). Defaults to `male`. Provide `female` to use the female-specific coefficient.
 - `--no-recursive` — do not search subdirectories.
 
 Argument validation checks, among other things, the consistency of HR value relationships.
@@ -309,8 +312,8 @@ If a file was recorded at a lower rate, with gaps, or using smart recording, som
 ### 4. `power_channel_is_low_coverage` and `speed_channel_is_low_coverage` are heuristics
 These are auxiliary signals based on data coverage, not an objective measure of sensor quality.
 
-### 5. `Pw:Hr decoupling` is simplified
-The metric is based on a simplified 50/50 split of the activity and should be interpreted with caution, especially for workouts containing warm-up, cool-down, and intervals.
+### 5. `Pw:Hr decoupling` methodology
+Decoupling is calculated as the relative change in **Efficiency Factor** (NP / average HR) between the first and second halves of the activity, split at the time midpoint (elapsed seconds of paired power+HR data). Each half must contain at least 60 paired seconds; otherwise the value is withheld. The EF-based approach is more stable than a ratio-of-ratios approach and less sensitive to isolated HR spikes. It should still be interpreted with caution for workouts that contain a substantial warm-up, cool-down, or interval structure.
 
 ### 6. Grade is calculated conservatively
 Gradient metrics are only calculated for activities confirmed as outdoor.
@@ -363,7 +366,6 @@ fitdecode
 ---
 
 ## Licence
-
 MIT, Apache-2.0
 
 ---
@@ -376,3 +378,35 @@ Potential future additions:
 - separate quality statuses for speed/grade/HR metrics,
 - better reason codes in `file_inventory.csv`,
 - support for additional metrics and coaching reports.
+
+---
+
+## Changelog
+
+### v3.4.0
+
+**New metrics and fields:**
+- `efficiency_factor` — Efficiency Factor (NP / average HR) exported at activity level.
+- `work_kj_basis` — provenance field for `work_kj`, indicating the calculation path: `dense_1hz_sum`, `session_avg_x_timer`, or `sparse_observed_only`.
+- `coasting_time_sec` — seconds with zero power recorded on a dense timeline.
+- Left/right pedal balance now decoded using explicit device bitmasks.
+
+**Improved calculations:**
+- HR zone boundaries now use separate tables for LTHR-based zones (`_HR_ZONE_BOUNDS_LTHR`) and max-HR-based zones (`_HR_ZONE_BOUNDS_MAX_HR`), selected automatically depending on which reference value is available.
+- Pw:Hr decoupling rewritten — now EF-based (NP / avg HR per half), split at the time midpoint of paired power+HR data, with a minimum of 60 paired seconds per half before the value is returned.
+- NP rolling window (30 s) and sparse-minimum periods (25 s) promoted to named constants.
+
+**Extended best efforts:**
+- Best effort durations extended from 8 to 16: 2 s, 5 s, 10 s, 15 s, 20 s, 30 s, 1 min, 2 min, 3 min, 5 min, 6 min, 8 min, 10 min, 20 min, 45 min, 60 min.
+
+**New CLI flag:**
+- `--sex {male,female}` — selects the TRIMP coefficient. Defaults to `male`.
+
+**Hardened parsing:**
+- `trainer_mode` extraction no longer produces a stale intermediate value from unrelated event messages.
+
+> **Migration note:** v3.4.0 adds three new columns to `activities.csv` (`work_kj_basis`, `efficiency_factor`, `coasting_time_sec`). If you have an existing `activities.csv` from v3.3.x, delete or rename it before running v3.4.0 — the tool will not append to a file with a mismatched schema.
+
+### v3.3.3
+
+Initial public version.
