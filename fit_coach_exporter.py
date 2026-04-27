@@ -607,29 +607,34 @@ def trimp_score(
     return float(total / 60.0) if count > 0 else None
 
 
-def calculate_pw_hr_decoupling(df_1hz: pd.DataFrame) -> Optional[float]:
+def calculate_pw_hr_decoupling(
+    df_1hz: pd.DataFrame,
+) -> Tuple[Optional[float], str]:
     """
     EF-based Pw:Hr aerobic decoupling — first half vs second half by elapsed time.
 
     Splits the active portion (power > 0 AND heart_rate > 0) at the
-    elapsed-time midpoint — not at the midpoint of paired row count.
+    elapsed-time midpoint — not at the midpoint of paired row count.  This
+    ensures pauses, sparse recording, and uneven pacing do not bias the split.
     For each half, computes EF = NP / avg_HR and returns
     (EF₂ − EF₁) / EF₁ × 100.
 
-    This metric is most meaningful for steady-state aerobic efforts such as
-    threshold or long endurance rides.  Interval workouts, sprints, and
-    activities with significant warm-up/cool-down will produce values that
-    are harder to interpret — treat with caution in those contexts.
+    INTERPRETATION NOTE:
+      This metric is most meaningful for long, steady aerobic efforts (Z2/Z3).
+      Interval workouts, sprints, and activities with significant warm-up or
+      cool-down produce values that are harder to interpret — treat with caution.
 
-    Returns None when:
-    - Channels are absent.
-    - Either half has fewer than _PWHR_MIN_PAIRED_SECONDS_PER_HALF valid rows.
-    - NP or avg_HR cannot be computed for either half.
+    Returns (decoupling_pct, quality) where quality is one of:
+      "good"                   — sufficient data, effort reasonably steady
+      "limited_variable_effort" — enough data but high VI (variable effort)
+      "insufficient_data"       — too sparse to compute
+
+    Returns (None, "insufficient_data") when data is unavailable.
     """
     if df_1hz.empty:
-        return None
+        return None, "insufficient_data"
     if not {"power", "heart_rate"}.issubset(df_1hz.columns):
-        return None
+        return None, "insufficient_data"
 
     # Derive timeline density from inline quality column when available.
     is_dense = (
@@ -645,7 +650,7 @@ def calculate_pw_hr_decoupling(df_1hz: pd.DataFrame) -> Optional[float]:
     df_active = df_1hz[active_mask].copy()
 
     if len(df_active) < _PWHR_MIN_PAIRED_SECONDS_PER_HALF * 2:
-        return None
+        return None, "insufficient_data"
 
     # Time-based split at elapsed-time midpoint of the active portion.
     if "timestamp" in df_active.columns:
@@ -653,7 +658,7 @@ def calculate_pw_hr_decoupling(df_1hz: pd.DataFrame) -> Optional[float]:
         t_start = ts.dropna().min()
         t_end = ts.dropna().max()
         if pd.isna(t_start) or pd.isna(t_end) or t_start == t_end:
-            return None
+            return None, "insufficient_data"
         t_mid = t_start + (t_end - t_start) / 2
         first_half = df_active[ts < t_mid]
         second_half = df_active[ts >= t_mid]
@@ -664,9 +669,9 @@ def calculate_pw_hr_decoupling(df_1hz: pd.DataFrame) -> Optional[float]:
         second_half = df_active.iloc[mid:]
 
     if len(first_half) < _PWHR_MIN_PAIRED_SECONDS_PER_HALF:
-        return None
+        return None, "insufficient_data"
     if len(second_half) < _PWHR_MIN_PAIRED_SECONDS_PER_HALF:
-        return None
+        return None, "insufficient_data"
 
     np1 = normalized_power(first_half["power"].tolist(), timeline_is_dense=is_dense)
     np2 = normalized_power(second_half["power"].tolist(), timeline_is_dense=is_dense)
@@ -674,16 +679,30 @@ def calculate_pw_hr_decoupling(df_1hz: pd.DataFrame) -> Optional[float]:
     hr2 = float(second_half["heart_rate"].mean())
 
     if np1 is None or np2 is None:
-        return None
+        return None, "insufficient_data"
     if math.isnan(hr1) or math.isnan(hr2) or hr1 == 0 or hr2 == 0:
-        return None
+        return None, "insufficient_data"
 
     ef1 = np1 / hr1
     ef2 = np2 / hr2
 
     if ef1 == 0:
-        return None
-    return float((ef2 - ef1) / ef1 * 100.0)
+        return None, "insufficient_data"
+
+    decoupling = float((ef2 - ef1) / ef1 * 100.0)
+
+    # Quality heuristic: high Variability Index on the entire active segment
+    # suggests an interval session; decoupling is less interpretable in that case.
+    active_power = df_active["power"].dropna()
+    quality = "good"
+    if len(active_power) >= 30:
+        np_full = normalized_power(active_power.tolist(), timeline_is_dense=is_dense)
+        avg_full = float(active_power.mean())
+        vi = variability_index(np_full, avg_full)
+        if vi is not None and vi > 1.10:
+            quality = "limited_variable_effort"
+
+    return decoupling, quality
 
 
 def time_in_power_zones(
@@ -916,6 +935,45 @@ class BestEffortRow:
 
 
 @dataclass
+class WorkoutStepExecutionRow:
+    """
+    Actual execution metrics for one workout step, aligned to a FIT lap.
+
+    step_index is matched to a lap by ordinal position (step[i] ↔ lap[i]).
+    When the step/lap counts do not match we emit rows only for paired entries.
+    Fields are None when the required data channel is absent or the step-lap
+    alignment cannot be established.
+
+    compliance_pct = time_in_target_sec / actual_elapsed_s × 100
+    completion_pct = actual_elapsed_s / planned_duration_s × 100
+    """
+    source_file: str
+    athlete: Optional[str]
+    export_schema_version: str
+    step_index: Optional[int]
+    step_name: Optional[str]
+    intensity: Optional[str]
+    target_type: Optional[str]
+    target_low: Optional[float]
+    target_high: Optional[float]
+    planned_duration_s: Optional[float]
+    lap_index: Optional[int]
+    actual_elapsed_s: Optional[float]
+    actual_avg_power_w: Optional[float]
+    actual_np_w: Optional[float]
+    actual_avg_hr_bpm: Optional[float]
+    actual_avg_cadence_rpm: Optional[float]
+    time_in_target_sec: Optional[float]
+    time_above_target_sec: Optional[float]
+    time_below_target_sec: Optional[float]
+    compliance_pct: Optional[float]
+    completion_pct: Optional[float]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.__dict__.copy()
+
+
+@dataclass
 class FileInventoryRow:
     """
     Processing outcome for a single source file.
@@ -1068,6 +1126,7 @@ class FitActivity:
     total_elapsed_time_s: Optional[float] = None
     total_timer_time_s: Optional[float] = None
     moving_time_s: Optional[float] = None
+    moving_time_basis: Optional[str] = None   # "speed" | "power_fallback" | "unavailable"
     total_distance_m: Optional[float] = None
     total_ascent_m: Optional[float] = None
     total_descent_m: Optional[float] = None
@@ -1094,7 +1153,9 @@ class FitActivity:
     work_kj: Optional[float] = None
     work_kj_basis: Optional[str] = None
     pw_hr_decoupling_pct: Optional[float] = None
+    pw_hr_quality: Optional[str] = None        # "good" | "limited_variable_effort" | "insufficient_data"
     trimp: Optional[float] = None
+    sex_used: Optional[str] = None             # "male" | "female" (TRIMP k-coefficient source)
     efficiency_factor: Optional[float] = None
     left_right_balance_pct: Optional[float] = None
     balance_left_pct: Optional[float] = None
@@ -1109,6 +1170,8 @@ class FitActivity:
     ftp_used_w: Optional[float] = None
     ftp_source: Optional[str] = None
     estimated_ftp_w: Optional[float] = None
+    estimated_ftp_method: Optional[str] = None          # e.g. "best_20min_x_0.95"
+    estimated_ftp_confidence: Optional[str] = None      # "low" | "medium" | "high"
     lthr_used_bpm: Optional[float] = None
     resting_hr_used_bpm: Optional[float] = None
     max_hr_used_bpm: Optional[float] = None
@@ -1130,6 +1193,11 @@ class FitActivity:
     record_count: int = 0
     lap_count: int = 0
     coasting_time_sec: Optional[float] = None
+    stopped_time_sec: Optional[float] = None
+    zero_power_time_sec: Optional[float] = None
+    time_above_ftp_sec: Optional[float] = None
+    power_zone_time_basis: Optional[str] = None   # "dense_full_timeline" | "sparse_observed_only" | "withheld"
+    hr_zone_time_basis: Optional[str] = None      # "dense_full_timeline" | "sparse_observed_only" | "withheld"
     z1_recovery_sec: Optional[float] = None
     z2_endurance_sec: Optional[float] = None
     z3_tempo_sec: Optional[float] = None
@@ -1645,8 +1713,16 @@ def _resolve_ftp(
     activity: FitActivity,
     power_1hz: List[Optional[float]],
     user_ftp: Optional[float],
+    quality: Optional["TimelineQuality"] = None,
 ) -> Optional[float]:
-    """Resolve FTP; priority: user CLI → estimated from best 20'."""
+    """Resolve FTP; priority: user CLI → estimated from best 20'.
+
+    When FTP is estimated, sets estimated_ftp_method and estimated_ftp_confidence:
+      - method: always "best_20min_x_0.95"
+      - confidence: "high" for dense reliable channels, "medium" for sparse
+        but sufficient, "low" otherwise.
+    User-supplied FTP is always treated as authoritative — no confidence rating.
+    """
     if user_ftp is not None:
         activity.ftp_used_w = user_ftp
         activity.ftp_source = "user_provided"
@@ -1658,6 +1734,17 @@ def _resolve_ftp(
         activity.estimated_ftp_w = estimated
         activity.ftp_used_w = estimated
         activity.ftp_source = "estimated"
+        activity.estimated_ftp_method = "best_20min_x_0.95"
+        # Confidence heuristic: dense + full coverage = medium (never "high"
+        # without a coached FTP test — 20' best from a training ride is
+        # always somewhat uncertain). Sparse or low-coverage = low.
+        if quality is not None:
+            if quality.timeline_is_dense_1hz and not quality.power_channel_is_low_coverage:
+                activity.estimated_ftp_confidence = "medium"
+            else:
+                activity.estimated_ftp_confidence = "low"
+        else:
+            activity.estimated_ftp_confidence = "low"
         return estimated
 
     return None
@@ -1724,11 +1811,22 @@ def compute_basic_activity_stats(
     gps_cols = [c for c in ["latitude_deg", "longitude_deg"] if c in df_1hz.columns]
     activity.has_gps = bool(gps_cols) and not df_1hz[gps_cols].dropna().empty
 
-    if quality.speed_channel_is_low_coverage:
+    if quality.speed_channel_is_low_coverage and quality.power_channel_is_low_coverage:
+        # Both speed and power are unreliable — cannot compute moving time.
         activity.moving_time_s = None
+        activity.moving_time_basis = "unavailable"
+    elif quality.speed_channel_is_low_coverage and not quality.power_channel_is_low_coverage:
+        # Speed unreliable but power channel is adequate — use power-only movement.
+        if "power" in df_1hz.columns:
+            activity.moving_time_s = float((df_1hz["power"].fillna(0) > 10).sum())
+            activity.moving_time_basis = "power_fallback"
+        else:
+            activity.moving_time_s = None
+            activity.moving_time_basis = "unavailable"
     else:
         moving_mask = _build_moving_mask(df_1hz)
         activity.moving_time_s = float(moving_mask.sum()) if moving_mask is not None else None
+        activity.moving_time_basis = "speed" if moving_mask is not None else "unavailable"
 
     activity.timeline_is_dense_1hz = quality.timeline_is_dense_1hz
     activity.power_channel_is_low_coverage = quality.power_channel_is_low_coverage
@@ -1770,11 +1868,28 @@ def _compute_load_metrics(
         activity.work_kj = wkj
         activity.work_kj_basis = basis
 
-    # Coasting seconds: rows where power == 0 on a dense timeline.
-    # On dense timelines zeros are meaningful (confirmed coasting / not pedalling).
-    # On sparse timelines zeros may just be absent data; the metric is withheld.
+    # Time distribution metrics.
+    # On dense timelines zeros are meaningful (real coasting / stopped).
+    # On sparse timelines gaps are unknown; metrics are withheld to avoid false precision.
     if activity.timeline_is_dense_1hz and "power" in df_1hz.columns:
-        activity.coasting_time_sec = float((df_1hz["power"].fillna(0) == 0).sum())
+        pwr = df_1hz["power"].fillna(0)
+        has_speed = "speed" in df_1hz.columns
+        spd = df_1hz["speed"].fillna(0) if has_speed else None
+
+        activity.zero_power_time_sec = float((pwr <= 5).sum())
+
+        if spd is not None:
+            # Stopped: not moving (speed < 0.5 m/s) AND near-zero power
+            activity.stopped_time_sec = float(((spd < 0.5) & (pwr <= 5)).sum())
+            # Coasting: moving (speed >= 0.5 m/s) but no useful power
+            activity.coasting_time_sec = float(((spd >= 0.5) & (pwr <= 5)).sum())
+        else:
+            # No speed — zero-power proxy for stopped; coasting undifferentiated.
+            activity.stopped_time_sec = float((pwr <= 5).sum())
+            activity.coasting_time_sec = None
+
+        if effective_ftp is not None and effective_ftp > 0:
+            activity.time_above_ftp_sec = float((pwr > effective_ftp).sum())
 
     if "cadence" in df_1hz.columns:
         cad_nz = df_1hz.loc[df_1hz["cadence"] > 0, "cadence"]
@@ -1787,8 +1902,16 @@ def _compute_power_zones(
     activity: FitActivity,
     df_1hz: pd.DataFrame,
     effective_ftp: Optional[float],
+    pmq: Optional[str],
 ) -> None:
-    """Compute Coggan 7-zone seconds and store on *activity*."""
+    """Compute Coggan 7-zone seconds and store on *activity*.  Sets zone_time_basis."""
+    if pmq == _PMQ_WITHHELD or pmq is None:
+        activity.power_zone_time_basis = "withheld"
+    elif activity.timeline_is_dense_1hz:
+        activity.power_zone_time_basis = "dense_full_timeline"
+    else:
+        activity.power_zone_time_basis = "sparse_observed_only"
+
     zp = time_in_power_zones(df_1hz, effective_ftp)
     activity.z1_recovery_sec = zp["z1_recovery_sec"]
     activity.z2_endurance_sec = zp["z2_endurance_sec"]
@@ -1833,7 +1956,7 @@ def compute_power_metrics(
         "power", pd.Series(dtype=float)
     ).tolist()
 
-    effective_ftp = _resolve_ftp(activity, power_1hz, user_ftp)
+    effective_ftp = _resolve_ftp(activity, power_1hz, user_ftp, quality=quality)
     activity.is_complete_for_power_analysis = (
         activity.has_power and activity.ftp_used_w is not None
     )
@@ -1881,7 +2004,7 @@ def compute_power_metrics(
         )
 
     _compute_load_metrics(activity, df_1hz, effective_ftp)
-    _compute_power_zones(activity, df_1hz, effective_ftp)
+    _compute_power_zones(activity, df_1hz, effective_ftp, pmq)
 
     return effective_ftp
 
@@ -1894,7 +2017,8 @@ def compute_hr_metrics(
     lthr: Optional[float],
     sex: str = "male",
 ) -> None:
-    """Compute TRIMP, Pw:Hr decoupling, and HR zones.  Mutates *activity*."""
+    """Compute TRIMP, Pw:Hr decoupling, HR zones, and related flags.  Mutates *activity*."""
+    activity.sex_used = sex
     activity.is_complete_for_hr_analysis = activity.has_hr and (
         lthr is not None or max_hr is not None
     )
@@ -1902,7 +2026,16 @@ def compute_hr_metrics(
         "heart_rate", pd.Series(dtype=float)
     ).tolist()
     activity.trimp = trimp_score(hr_1hz, resting_hr, max_hr, sex=sex)
-    activity.pw_hr_decoupling_pct = calculate_pw_hr_decoupling(df_1hz)
+    activity.pw_hr_decoupling_pct, activity.pw_hr_quality = calculate_pw_hr_decoupling(df_1hz)
+
+    # HR zone time basis flag.
+    if lthr is not None or max_hr is not None:
+        activity.hr_zone_time_basis = (
+            "dense_full_timeline" if activity.timeline_is_dense_1hz
+            else "sparse_observed_only"
+        )
+    else:
+        activity.hr_zone_time_basis = "withheld"
 
     zh = time_in_hr_zones(df_1hz, lthr, max_hr)
     activity.hr_z1_sec = zh["hr_z1_sec"]
@@ -1938,6 +2071,157 @@ def compute_session_metrics(
         activity.normalized_power_w, activity.avg_heart_rate_bpm
     )
     return effective_ftp
+
+
+# ---------------------------------------------------------------------------
+# Step 5b — workout step execution alignment
+# ---------------------------------------------------------------------------
+
+
+def build_workout_step_execution(
+    source_file: str,
+    athlete: Optional[str],
+    laps: List[LapRow],
+    workout_steps: List[WorkoutStepRow],
+    df_1hz: pd.DataFrame,
+) -> List[WorkoutStepExecutionRow]:
+    """
+    Align workout steps to executed laps and compute compliance metrics.
+
+    Matching strategy: ordinal pairing — step[i] ↔ lap[i].  This is the
+    simplest reliable approach when the device creates one lap per step.
+    When counts differ, only the overlapping prefix is reported; unmatched
+    steps or laps are silently skipped (they may represent warm-up or
+    cool-down laps that have no corresponding workout step).
+
+    For each paired (step, lap):
+    - Extract 1 Hz records in the lap's time window.
+    - Compute actual avg power, NP (if ≥ 30 samples), avg HR, avg cadence.
+    - If target_type is "power": count seconds in [target_low, target_high].
+    - compliance_pct = time_in_target / actual_elapsed × 100.
+    - completion_pct = actual_elapsed / planned_duration × 100.
+
+    Returns an empty list when no paired (step, lap) rows exist or df_1hz
+    is empty.
+    """
+    if not laps or not workout_steps or df_1hz.empty:
+        return []
+    if "timestamp" not in df_1hz.columns:
+        return []
+
+    ts_col = pd.to_datetime(df_1hz["timestamp"], utc=True, errors="coerce")
+
+    rows: List[WorkoutStepExecutionRow] = []
+    n_pairs = min(len(laps), len(workout_steps))
+
+    for i in range(n_pairs):
+        lap = laps[i]
+        step = workout_steps[i]
+
+        # Parse lap time window.
+        t_lap_start: Optional[pd.Timestamp] = (
+            pd.to_datetime(lap.start_time, utc=True, errors="coerce")
+            if lap.start_time else None
+        )
+        t_lap_end: Optional[pd.Timestamp] = (
+            pd.to_datetime(lap.timestamp, utc=True, errors="coerce")
+            if lap.timestamp else None
+        )
+
+        # Extract 1 Hz rows for this lap.
+        if t_lap_start is not None and t_lap_end is not None and not pd.isna(t_lap_start) and not pd.isna(t_lap_end):
+            mask = (ts_col >= t_lap_start) & (ts_col <= t_lap_end)
+        else:
+            # No reliable time window — skip compliance analysis but still emit row.
+            mask = pd.Series(False, index=df_1hz.index)
+
+        lap_df = df_1hz[mask].copy()
+        actual_elapsed = safe_float(lap.total_elapsed_time_s)
+
+        # Actual metrics from 1 Hz records.
+        actual_avg_power: Optional[float] = None
+        actual_np: Optional[float] = None
+        actual_avg_hr: Optional[float] = None
+        actual_avg_cad: Optional[float] = None
+        time_in_target: Optional[float] = None
+        time_above_target: Optional[float] = None
+        time_below_target: Optional[float] = None
+        compliance_pct: Optional[float] = None
+        completion_pct: Optional[float] = None
+
+        if not lap_df.empty:
+            if "power" in lap_df.columns:
+                pwr = lap_df["power"].dropna()
+                if not pwr.empty:
+                    actual_avg_power = float(pwr.mean())
+                    if len(pwr) >= _NP_ROLLING_WINDOW_SEC:
+                        actual_np = normalized_power(
+                            pwr.tolist(), timeline_is_dense=False
+                        )
+
+            if "heart_rate" in lap_df.columns:
+                hr_vals = lap_df["heart_rate"].dropna()
+                if not hr_vals.empty:
+                    actual_avg_hr = float(hr_vals.mean())
+
+            if "cadence" in lap_df.columns:
+                cad_vals = lap_df.loc[lap_df["cadence"] > 0, "cadence"]
+                actual_avg_cad = float(cad_vals.mean()) if not cad_vals.empty else None
+
+            # Target compliance (power-only for now; HR and cadence targets
+            # could be added analogously).
+            tgt_type = step.target_type
+            tgt_lo = step.target_low
+            tgt_hi = step.target_high
+            if (
+                tgt_type is not None
+                and "power" in str(tgt_type).lower()
+                and tgt_lo is not None
+                and tgt_hi is not None
+                and "power" in lap_df.columns
+            ):
+                pwr_all = lap_df["power"].fillna(0)
+                n_total = len(pwr_all)
+                if n_total > 0:
+                    in_target = ((pwr_all >= tgt_lo) & (pwr_all <= tgt_hi)).sum()
+                    above = (pwr_all > tgt_hi).sum()
+                    below = (pwr_all < tgt_lo).sum()
+                    time_in_target = float(in_target)
+                    time_above_target = float(above)
+                    time_below_target = float(below)
+                    if actual_elapsed and actual_elapsed > 0:
+                        compliance_pct = float(time_in_target / actual_elapsed * 100.0)
+
+        # Completion % (actual time vs planned duration).
+        planned_dur = safe_float(step.duration_value)
+        if planned_dur is not None and planned_dur > 0 and actual_elapsed is not None:
+            completion_pct = float(actual_elapsed / planned_dur * 100.0)
+
+        rows.append(WorkoutStepExecutionRow(
+            source_file=source_file,
+            athlete=athlete,
+            export_schema_version=EXPORT_SCHEMA_VERSION,
+            step_index=step.step_index,
+            step_name=step.wkt_name,
+            intensity=step.intensity,
+            target_type=step.target_type,
+            target_low=step.target_low,
+            target_high=step.target_high,
+            planned_duration_s=planned_dur,
+            lap_index=i + 1,
+            actual_elapsed_s=actual_elapsed,
+            actual_avg_power_w=actual_avg_power,
+            actual_np_w=actual_np,
+            actual_avg_hr_bpm=actual_avg_hr,
+            actual_avg_cadence_rpm=actual_avg_cad,
+            time_in_target_sec=time_in_target,
+            time_above_target_sec=time_above_target,
+            time_below_target_sec=time_below_target,
+            compliance_pct=compliance_pct,
+            completion_pct=completion_pct,
+        ))
+
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -2293,7 +2577,7 @@ def _iter_dicts(rows: List[Any]) -> Iterator[Dict[str, Any]]:
 
 class BatchCsvWriter:
     """
-    Container for all seven CsvStreamWriter instances for one batch run.
+    Container for all eight CsvStreamWriter instances for one batch run.
 
     Construction validates every pre-existing CSV header.  If any file has a
     mismatched schema, CsvSchemaMismatchError propagates immediately and the
@@ -2328,6 +2612,9 @@ class BatchCsvWriter:
         self.file_inventory = CsvStreamWriter(
             output_dir / "file_inventory.csv", FILE_INVENTORY_COLUMNS
         )
+        self.workout_step_execution = CsvStreamWriter(
+            output_dir / "workout_step_execution.csv", WORKOUT_STEP_EXECUTION_COLUMNS
+        )
 
         for writer in self._all_writers():
             writer.ensure_header()
@@ -2340,6 +2627,7 @@ class BatchCsvWriter:
         yield self.records_1hz
         yield self.best_efforts
         yield self.file_inventory
+        yield self.workout_step_execution
 
     def write_parsed_file(self, result: "ParsedFitFile") -> None:
         """Append all rows from *result* to the corresponding CSV files."""
@@ -2350,6 +2638,7 @@ class BatchCsvWriter:
         self.records_1hz.append_dicts(_iter_dicts(result.records_1hz))
         self.best_efforts.append_dicts(_iter_dicts(result.best_efforts))
         self.file_inventory.append_rows([result.inventory.to_dict()])
+        self.workout_step_execution.append_dicts(_iter_dicts(result.workout_step_execution))
 
 
 # ---------------------------------------------------------------------------
@@ -2371,6 +2660,7 @@ class ParsedFitFile:
     records_extracted: List[RecordExtractedRow] = field(default_factory=list)
     records_1hz: List[Record1HzRow] = field(default_factory=list)
     best_efforts: List[BestEffortRow] = field(default_factory=list)
+    workout_step_execution: List[WorkoutStepExecutionRow] = field(default_factory=list)
     inventory: FileInventoryRow = field(
         default_factory=lambda: FileInventoryRow(
             source_file="",
@@ -2634,6 +2924,24 @@ def parse_fit_file(
         return _make_error_result(activity, inventory, exc,
                                   "build_best_efforts", is_operational=False)
 
+    # Stage 10 ────────────────────────────────────────────────────────────────
+    workout_step_execution: List[WorkoutStepExecutionRow] = []
+    if activity.has_structured_workout and workout_steps and laps:
+        try:
+            workout_step_execution = build_workout_step_execution(
+                source_file=file_path.name,
+                athlete=athlete,
+                laps=laps,
+                workout_steps=workout_steps,
+                df_1hz=df_1hz,
+            )
+        except Exception as exc:
+            # Non-fatal: log and continue; workout_step_execution stays empty.
+            logger.warning(
+                "Workout step execution alignment failed for %s: %s",
+                activity.source_file, exc,
+            )
+
     return ParsedFitFile(
         activity=activity,
         laps=laps,
@@ -2641,6 +2949,7 @@ def parse_fit_file(
         records_extracted=records_extracted,
         records_1hz=records_1hz,
         best_efforts=best_efforts,
+        workout_step_execution=workout_step_execution,
         inventory=inventory,
     )
 
@@ -2668,7 +2977,7 @@ ACTIVITIES_COLUMNS: List[str] = [
     "manufacturer", "product", "serial_number", "time_created",
     "sport", "sub_sport", "activity_type", "event",
     "start_time", "local_start_time",
-    "total_elapsed_time_s", "total_timer_time_s", "moving_time_s",
+    "total_elapsed_time_s", "total_timer_time_s", "moving_time_s", "moving_time_basis",
     "duration_hms", "timer_hms", "moving_time_hms",
     "total_distance_m", "total_distance_km",
     "total_ascent_m", "total_descent_m",
@@ -2680,13 +2989,15 @@ ACTIVITIES_COLUMNS: List[str] = [
     "avg_cadence_rpm", "max_cadence_rpm", "avg_cadence_no_zeros_rpm",
     "avg_temperature_c", "max_temperature_c", "calories_kcal",
     "training_stress_score", "intensity_factor", "variability_index",
-    "work_kj", "work_kj_basis", "pw_hr_decoupling_pct", "trimp",
+    "work_kj", "work_kj_basis", "pw_hr_decoupling_pct", "pw_hr_quality",
+    "trimp", "sex_used",
     "efficiency_factor",
     "left_right_balance_pct", "balance_left_pct", "balance_right_pct",
     "pedal_smoothness_pct", "torque_effectiveness_pct",
     "trainer_mode", "indoor", "indoor_source",
     "has_structured_workout", "workout_step_count",
     "ftp_used_w", "ftp_source", "estimated_ftp_w",
+    "estimated_ftp_method", "estimated_ftp_confidence",
     "lthr_used_bpm", "resting_hr_used_bpm", "max_hr_used_bpm", "hr_zone_source",
     "has_power", "has_hr", "has_cadence", "has_gps", "has_speed",
     "is_complete_for_power_analysis", "is_complete_for_hr_analysis",
@@ -2694,7 +3005,9 @@ ACTIVITIES_COLUMNS: List[str] = [
     "power_channel_is_low_coverage", "speed_channel_is_low_coverage",
     "timeline_median_gap_s", "timeline_max_gap_s",
     "power_metrics_quality", "power_quality_note",
-    "record_count", "lap_count", "coasting_time_sec",
+    "record_count", "lap_count",
+    "coasting_time_sec", "stopped_time_sec", "zero_power_time_sec", "time_above_ftp_sec",
+    "power_zone_time_basis", "hr_zone_time_basis",
     "z1_recovery_sec", "z2_endurance_sec", "z3_tempo_sec", "z4_threshold_sec",
     "z5_vo2_sec", "z6_anaerobic_sec", "z7_neuromuscular_sec",
     "hr_z1_sec", "hr_z2_sec", "hr_z3_sec", "hr_z4_sec", "hr_z5_sec",
@@ -2760,6 +3073,19 @@ FILE_INVENTORY_COLUMNS: List[str] = [
     "error_class",
     "error_stage",
     "status_message",
+]
+
+WORKOUT_STEP_EXECUTION_COLUMNS: List[str] = [
+    "export_schema_version",
+    "source_file", "athlete",
+    "step_index", "step_name", "intensity",
+    "target_type", "target_low", "target_high",
+    "planned_duration_s",
+    "lap_index", "actual_elapsed_s",
+    "actual_avg_power_w", "actual_np_w",
+    "actual_avg_hr_bpm", "actual_avg_cadence_rpm",
+    "time_in_target_sec", "time_above_target_sec", "time_below_target_sec",
+    "compliance_pct", "completion_pct",
 ]
 
 
